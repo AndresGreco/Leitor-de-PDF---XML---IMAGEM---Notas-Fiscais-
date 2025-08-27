@@ -1,2 +1,9 @@
 # Leitor-de-PDF---XML---IMAGEM---Notas-Fiscais-
 Esse é um arquivo automático que pega imagens, pdfs ou tabelas em uma pasta lê os dados delas e centraliza tudo em outra tabela já categorizando
+
+
+Tem 2 opções ou criar uma nova pasta dentro do VB onde estao as NFs e entrao criar um arquivo chamado "ler_notas_avancado.py" - então so copiar e colar o codigo e mudar a API do GEMINI para a sua...
+
+Outra opção é um "executavel" sem o VB - vai criar um arquivo no bloco de notas e vai colar o codigo do extrator_notas.py - mudar a API do GEMINI...
+depois criar um arquivo no bloco de notas e colar o codigo do executar_extrator e salvar como executar_extrator.bat 
+se os dois arquivos estiverem na pasta onde estao as NFs é so executar esse arquivo .bat que ele vai iniciar o extrator e conferir se tem todas os arquivos necessarios para funcionar...
