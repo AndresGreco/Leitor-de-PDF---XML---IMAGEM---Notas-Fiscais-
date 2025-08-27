@@ -1,0 +1,612 @@
+import os
+import re
+import io
+import json
+import time
+import logging
+import argparse
+from typing import List, Dict, Any, Optional, Tuple
+
+import fitz  # PyMuPDF
+from PIL import Image, ImageOps, ImageFilter, ImageEnhance, ExifTags
+import pytesseract
+import pandas as pd
+from dateutil import parser as dateparser
+import xml.etree.ElementTree as ET
+
+# =========================
+# CONFIGURAÇÕES GERAIS
+# =========================
+
+# COLOQUE SUA CHAVE DO GEMINI AQUI:
+GEMINI_API_KEY = "------"  # Substitua pela sua chave real
+
+# Configurações do Tesseract
+TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"# ajuste se necessário
+TESSERACT_LANG = "por+eng"
+OCR_PSM = "6"
+
+# Modelo do Gemini
+DEFAULT_GEMINI_MODEL = "gemini-1.5-flash"  # Mais econômico
+
+# Extensões suportadas
+IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
+PDF_EXTS = {".pdf"}
+XML_EXTS = {".xml"}
+
+# Diretórios padrão
+DEFAULT_INPUT_DIR = "Banco de NFs"  # Pasta padrão para buscar arquivos
+DEFAULT_OUTPUT_DIR = "./saida"
+
+# =========================
+# LOGGING
+# =========================
+def setup_logging(log_path: Optional[str] = None, verbose: bool = True):
+    handlers = []
+    fmt = "%(asctime)s - %(levelname)s - %(message)s"
+    if verbose:
+        handlers.append(logging.StreamHandler())
+    if log_path:
+        os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+        handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
+    logging.basicConfig(level=logging.INFO, format=fmt, handlers=handlers)
+
+# =========================
+# TESSERACT
+# =========================
+def setup_tesseract():
+    if TESSERACT_PATH:
+        pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+        if not os.path.isfile(TESSERACT_PATH):
+            logging.warning(f"Tesseract definido em {TESSERACT_PATH}, mas não encontrado.")
+
+# =========================
+# GEMINI
+# =========================
+def init_gemini(api_key: Optional[str], model_name: str):
+    """Inicializa o cliente Gemini."""
+    # Usa a chave hardcoded se não for fornecida outra
+    api_key_to_use = api_key or GEMINI_API_KEY or os.environ.get("GEMINI_API_KEY")
+    
+    if not api_key_to_use or api_key_to_use == "SUA_CHAVE_AQUI":
+        raise RuntimeError(
+            "Chave do Gemini não configurada!\n"
+            "1. Edite o arquivo e substitua 'SUA_CHAVE_AQUI' pela sua chave real, OU\n"
+            "2. Defina a variável de ambiente GEMINI_API_KEY, OU\n"
+            "3. Use --api-key na linha de comando"
+        )
+    
+    try:
+        import google.generativeai as genai
+    except ImportError:
+        raise RuntimeError("Biblioteca google-generativeai não instalada. Execute: pip install google-generativeai")
+
+    genai.configure(api_key=api_key_to_use)
+
+    generation_config = {
+        "temperature": 0.2,
+        "top_p": 0.9,
+        "top_k": 40,
+        "max_output_tokens": 8192,
+        "response_mime_type": "application/json",
+    }
+    
+    model = genai.GenerativeModel(model_name=model_name, generation_config=generation_config)
+    return model, generation_config
+
+# =========================
+# UTILS
+# =========================
+def list_files(in_dir: str) -> List[str]:
+    """Lista todos os arquivos suportados no diretório."""
+    if not os.path.exists(in_dir):
+        logging.error(f"Diretório não existe: {in_dir}")
+        return []
+    
+    files = []
+    for root, _, fnames in os.walk(in_dir):
+        for fn in fnames:
+            ext = os.path.splitext(fn)[1].lower()
+            if ext in IMAGE_EXTS | PDF_EXTS | XML_EXTS:
+                files.append(os.path.join(root, fn))
+    files.sort()
+    return files
+
+def safe_open_image(path: str) -> Image.Image:
+    """Abre imagem com correção de orientação."""
+    img = Image.open(path)
+    try:
+        img = ImageOps.exif_transpose(img)
+    except Exception:
+        pass
+    return img.convert("RGB")
+
+def preprocess_image(img: Image.Image) -> Image.Image:
+    """Melhora a imagem para OCR."""
+    gray = ImageOps.grayscale(img)
+    gray = ImageOps.autocontrast(gray)
+    sharp = ImageEnhance.Sharpness(gray).enhance(1.3)
+    return sharp
+
+def ocr_image_to_text(img: Image.Image) -> str:
+    """Extrai texto da imagem usando OCR."""
+    config = f'--psm {OCR_PSM}'
+    text = pytesseract.image_to_string(img, lang=TESSERACT_LANG, config=config)
+    return text
+
+def normalize_whitespace(s: str) -> str:
+    """Normaliza espaços em branco."""
+    return re.sub(r"[ \t]+", " ", s).strip()
+
+def parse_decimal_mixed(s: str) -> Optional[float]:
+    """
+    Converte string de valor monetário para float.
+    Exemplos:
+      "R$ 1.234,56" -> 1234.56
+      "US\$ 2,345.67" -> 2345.67
+      "€ 1.234" -> 1234.0
+    """
+    if s is None:
+        return None
+    s = str(s)
+    if not s.strip():
+        return None
+
+    # Remove símbolos de moeda (CORRIGIDO: escape sequences)
+    s = (s.replace("R$", "")
+           .replace("US\$", "")  # Removido o backslash
+           .replace("USD", "")
+           .replace("€", "")
+           .replace("EUR", "")
+           .replace("BRL", "")
+           .replace("U$", "")
+           .replace("U$S", ""))
+
+    s = s.strip()
+    s = re.sub(r"[^0-9\-,.]", "", s)
+
+    if not s:
+        return None
+
+    # Lógica para determinar separador decimal
+    if "," in s and "." in s:
+        last_comma = s.rfind(",")
+        last_dot = s.rfind(".")
+        if last_comma > last_dot:
+            # Formato brasileiro: 1.234,56
+            s = s.replace(".", "")
+            s = s.replace(",", ".")
+        else:
+            # Formato americano: 1,234.56
+            s = s.replace(",", "")
+    elif "," in s and "." not in s:
+        # Formato brasileiro simples: 1234,56
+        s = s.replace(",", ".")
+    else:
+        # Formato americano ou inteiro
+        s = s.replace(",", "")
+
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+def parse_date_flexible(s: str) -> Optional[str]:
+    """Converte string de data para formato YYYY-MM-DD."""
+    if not s:
+        return None
+    try:
+        dt = dateparser.parse(s, dayfirst=True, fuzzy=True)
+        if dt:
+            return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return None
+    return None
+
+def ensure_list(x):
+    """Garante que o valor seja uma lista."""
+    if x is None:
+        return []
+    if isinstance(x, list):
+        return x
+    return [x]
+
+def write_text(path: str, content: str):
+    """Escreve texto em arquivo."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content or "")
+
+def read_file_bytes(path: str) -> bytes:
+    """Lê arquivo como bytes."""
+    with open(path, "rb") as f:
+        return f.read()
+
+# =========================
+# EXTRAÇÃO DE TEXTO
+# =========================
+def extract_text_from_pdf(path: str, dpi: int = 300) -> str:
+    """Extrai texto de PDF com fallback para OCR."""
+    texts = []
+    try:
+        with fitz.open(path) as doc:
+            for page in doc:
+                # Tenta extrair texto nativo
+                t = page.get_text("text")
+                if t and len(t.strip()) > 20:
+                    texts.append(t)
+                else:
+                    # Fallback OCR
+                    pix = page.get_pixmap(dpi=dpi, alpha=False)
+                    img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+                    img = preprocess_image(img)
+                    t_ocr = ocr_image_to_text(img)
+                    texts.append(t_ocr)
+    except Exception as e:
+        logging.error(f"Erro ao ler PDF {path}: {e}")
+    return "\n".join(texts)
+
+def extract_text_from_image(path: str) -> str:
+    """Extrai texto de imagem usando OCR."""
+    try:
+        img = safe_open_image(path)
+        img = preprocess_image(img)
+        return ocr_image_to_text(img)
+    except Exception as e:
+        logging.error(f"Erro ao ler imagem {path}: {e}")
+        return ""
+
+# =========================
+# XML (NFe) - SIMPLIFICADO
+# =========================
+def parse_nfe_xml_simple(path: str) -> Optional[Dict[str, Any]]:
+    """Extração simplificada de NFe XML."""
+    try:
+        tree = ET.parse(path)
+        root = tree.getroot()
+
+        # Busca elementos importantes (sem namespace complexo)
+        def find_text(xpath_list):
+            for xpath in xpath_list:
+                elem = root.find(xpath)
+                if elem is not None and elem.text:
+                    return elem.text.strip()
+            return None
+
+        # Tenta diferentes caminhos para os dados
+        fornecedor = find_text([
+            ".//emit/xNome", ".//xNome", 
+            ".//*[local-name()='emit']/*[local-name()='xNome']"
+        ])
+        
+        cnpj = find_text([
+            ".//emit/CNPJ", ".//CNPJ",
+            ".//*[local-name()='emit']/*[local-name()='CNPJ']"
+        ])
+        
+        data_emissao = find_text([
+            ".//ide/dhEmi", ".//ide/dEmi", ".//dhEmi", ".//dEmi",
+            ".//*[local-name()='ide']/*[local-name()='dhEmi']",
+            ".//*[local-name()='ide']/*[local-name()='dEmi']"
+        ])
+        
+        numero_nota = find_text([
+            ".//ide/nNF", ".//nNF",
+            ".//*[local-name()='ide']/*[local-name()='nNF']"
+        ])
+        
+        total_nota = find_text([
+            ".//total//vNF", ".//vNF",
+            ".//*[local-name()='total']//*[local-name()='vNF']"
+        ])
+
+        return {
+            "fonte": os.path.basename(path),
+            "fornecedor": fornecedor,
+            "cnpj": cnpj,
+            "data_emissao": parse_date_flexible(data_emissao),
+            "numero_nota": numero_nota,
+            "itens": [],  # Simplificado - não extrai itens do XML
+            "total_nota": parse_decimal_mixed(total_nota),
+            "observacoes": None,
+            "origem": "xml-nfe-simple",
+        }
+    except Exception as e:
+        logging.error(f"Erro ao ler XML {path}: {e}")
+        return None
+
+# =========================
+# LLM (Gemini) - SIMPLIFICADO
+# =========================
+EXTRACTION_PROMPT = """
+Extraia os dados da nota fiscal e retorne APENAS um JSON válido no formato:
+
+{
+  "fornecedor": "nome do fornecedor",
+  "cnpj": "cnpj se encontrado",
+  "data_emissao": "AAAA-MM-DD",
+  "numero_nota": "número da nota",
+  "itens": [
+    {
+      "descricao": "descrição do item",
+      "quantidade": 1.0,
+      "valor_unitario": 10.50,
+      "valor_total": 10.50
+    }
+  ],
+  "total_nota": 100.50,
+  "observacoes": "observações se houver"
+}
+
+IMPORTANTE: 
+- Retorne SOMENTE o JSON, sem texto adicional
+- Use null para campos não encontrados
+- Valores numéricos com ponto decimal (ex: 123.45)
+
+DOCUMENTO:
+"""
+
+def call_gemini_extract_simple(model, generation_config, doc_text: str) -> str:
+    """Chama Gemini de forma simplificada."""
+    prompt = EXTRACTION_PROMPT + doc_text[:150000]  # Limita tamanho
+    
+    try:
+        response = model.generate_content([prompt], generation_config=generation_config)
+        return (response.text or "").strip()
+    except Exception as e:
+        logging.error(f"Erro ao chamar Gemini: {e}")
+        return ""
+
+def parse_json_response(response: str) -> Optional[Dict[str, Any]]:
+    """Parse da resposta JSON do Gemini."""
+    if not response:
+        return None
+    
+    # Remove markdown se houver
+    response = response.strip()
+    if response.startswith("```"):
+        response = re.sub(r"^```[a-zA-Z]*\n?", "", response)
+        if response.endswith("```"):
+            response = response[:-3]
+    
+    # Tenta encontrar JSON
+    start = response.find("{")
+    end = response.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        json_str = response[start:end+1]
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            # Tenta corrigir vírgulas extras
+            json_str = re.sub(r",\s*([}\]])", r"\1", json_str)
+            try:
+                return json.loads(json_str)
+            except json.JSONDecodeError:
+                return None
+    return None
+
+# =========================
+# PROCESSAMENTO PRINCIPAL
+# =========================
+def process_file_simple(path: str, model=None, generation_config=None) -> List[Dict[str, Any]]:
+    """Processa um arquivo e retorna dados estruturados."""
+    ext = os.path.splitext(path)[1].lower()
+    base = os.path.basename(path)
+    logging.info(f"Processando: {base}")
+
+    # Extração de conteúdo
+    if ext in XML_EXTS:
+        # Para XML, tenta extração direta primeiro
+        structured = parse_nfe_xml_simple(path)
+        if structured:
+            return [structured]
+        # Se falhar, continua para LLM
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                text = f.read()
+        except:
+            return []
+    elif ext in IMAGE_EXTS:
+        text = extract_text_from_image(path)
+    elif ext in PDF_EXTS:
+        text = extract_text_from_pdf(path)
+    else:
+        logging.warning(f"Extensão não suportada: {ext}")
+        return []
+
+    if not text or len(text.strip()) < 10:
+        logging.warning(f"Pouco texto extraído de {base}")
+        return []
+
+    # Usa LLM se disponível
+    if model is None:
+        logging.warning(f"Modelo não disponível para {base}")
+        return []
+
+    try:
+        response = call_gemini_extract_simple(model, generation_config, text)
+        data = parse_json_response(response)
+        
+        if data:
+            # Normaliza dados
+            data["fonte"] = base
+            data["origem"] = "llm"
+            data["data_emissao"] = parse_date_flexible(data.get("data_emissao"))
+            data["total_nota"] = parse_decimal_mixed(data.get("total_nota"))
+            
+            # Normaliza itens
+            itens = ensure_list(data.get("itens", []))
+            for item in itens:
+                if isinstance(item, dict):
+                    item["quantidade"] = parse_decimal_mixed(item.get("quantidade"))
+                    item["valor_unitario"] = parse_decimal_mixed(item.get("valor_unitario"))
+                    item["valor_total"] = parse_decimal_mixed(item.get("valor_total"))
+            
+            data["itens"] = itens
+            return [data]
+        else:
+            logging.error(f"Falha ao extrair dados de {base}")
+            return []
+            
+    except Exception as e:
+        logging.error(f"Erro ao processar {base} com LLM: {e}")
+        return []
+
+# =========================
+# SAÍDA SIMPLIFICADA
+# =========================
+def flatten_data(data_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Converte dados estruturados em linhas planas para CSV/Excel."""
+    rows = []
+    
+    for data in data_list:
+        itens = data.get("itens", [])
+        base_row = {
+            "arquivo": data.get("fonte"),
+            "fornecedor": data.get("fornecedor"),
+            "cnpj": data.get("cnpj"),
+            "data_emissao": data.get("data_emissao"),
+            "numero_nota": data.get("numero_nota"),
+            "total_nota": data.get("total_nota"),
+            "observacoes": data.get("observacoes"),
+            "origem": data.get("origem"),
+        }
+        
+        if not itens:
+            # Sem itens, cria linha vazia
+            row = base_row.copy()
+            row.update({
+                "item_descricao": None,
+                "item_quantidade": None,
+                "item_unidade": None,
+                "item_valor_unitario": None,
+                "item_valor_total": None,
+            })
+            rows.append(row)
+        else:
+            # Uma linha por item
+            for item in itens:
+                if isinstance(item, dict):
+                    row = base_row.copy()
+                    row.update({
+                        "item_descricao": item.get("descricao"),
+                        "item_quantidade": item.get("quantidade"),
+                        "item_unidade": item.get("unidade"),
+                        "item_valor_unitario": item.get("valor_unitario"),
+                        "item_valor_total": item.get("valor_total"),
+                    })
+                    rows.append(row)
+    
+    return rows
+
+def save_results(rows: List[Dict[str, Any]], output_dir: str):
+    """Salva resultados em CSV e Excel."""
+    if not rows:
+        logging.warning("Nenhum dado para salvar.")
+        return
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    df = pd.DataFrame(rows)
+    
+    # Ordena colunas
+    column_order = [
+        "arquivo", "fornecedor", "cnpj", "data_emissao", "numero_nota",
+        "item_descricao", "item_quantidade", "item_unidade",
+        "item_valor_unitario", "item_valor_total", "total_nota",
+        "observacoes", "origem"
+    ]
+    
+    # Reordena colunas existentes
+    existing_cols = [col for col in column_order if col in df.columns]
+    other_cols = [col for col in df.columns if col not in column_order]
+    df = df[existing_cols + other_cols]
+    
+    # Salva arquivos
+    csv_path = os.path.join(output_dir, "notas_extraidas.csv")
+    xlsx_path = os.path.join(output_dir, "notas_extraidas.xlsx")
+    
+    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    
+    with pd.ExcelWriter(xlsx_path, engine="xlsxwriter") as writer:
+        df.to_excel(writer, index=False, sheet_name="Notas")
+    
+    logging.info(f"Resultados salvos:")
+    logging.info(f"- CSV: {csv_path}")
+    logging.info(f"- Excel: {xlsx_path}")
+    logging.info(f"- Total de linhas: {len(rows)}")
+
+# =========================
+# MAIN SIMPLIFICADO
+# =========================
+def main():
+    parser = argparse.ArgumentParser(description="Extrator de dados de notas fiscais")
+    parser.add_argument("--in-dir", default=DEFAULT_INPUT_DIR, 
+                       help=f"Pasta com os arquivos (padrão: {DEFAULT_INPUT_DIR})")
+    parser.add_argument("--out-dir", default=DEFAULT_OUTPUT_DIR,
+                       help=f"Pasta de saída (padrão: {DEFAULT_OUTPUT_DIR})")
+    parser.add_argument("--api-key", default=None,
+                       help="Chave do Gemini (opcional se já configurada no código)")
+    parser.add_argument("--model", default=DEFAULT_GEMINI_MODEL,
+                       help=f"Modelo Gemini (padrão: {DEFAULT_GEMINI_MODEL})")
+    parser.add_argument("--no-llm", action="store_true",
+                       help="Processa apenas XMLs sem usar LLM")
+    
+    args = parser.parse_args()
+    
+    # Setup
+    log_path = os.path.join(args.out_dir, "processamento.log")
+    setup_logging(log_path, verbose=True)
+    setup_tesseract()
+    
+    logging.info("=== EXTRATOR DE NOTAS FISCAIS ===")
+    logging.info(f"Pasta de entrada: {args.in_dir}")
+    logging.info(f"Pasta de saída: {args.out_dir}")
+    
+    # Verifica se pasta existe
+    if not os.path.exists(args.in_dir):
+        logging.error(f"Pasta não existe: {args.in_dir}")
+        logging.info(f"Criando pasta padrão: {args.in_dir}")
+        os.makedirs(args.in_dir, exist_ok=True)
+        logging.info("Coloque seus arquivos na pasta criada e execute novamente.")
+        return
+    
+    # Lista arquivos
+    files = list_files(args.in_dir)
+    if not files:
+        logging.error(f"Nenhum arquivo suportado encontrado em {args.in_dir}")
+        logging.info("Formatos suportados: PDF, JPG, PNG, XML")
+        return
+    
+    logging.info(f"Encontrados {len(files)} arquivos para processar")
+    
+    # Inicializa Gemini (se necessário)
+    model, generation_config = None, None
+    if not args.no_llm:
+        try:
+            model, generation_config = init_gemini(args.api_key, args.model)
+            logging.info(f"Gemini inicializado com modelo: {args.model}")
+        except Exception as e:
+            logging.warning(f"Falha ao inicializar Gemini: {e}")
+            logging.info("Continuando apenas com processamento de XMLs...")
+    
+    # Processa arquivos
+    all_data = []
+    for i, file_path in enumerate(files, 1):
+        logging.info(f"[{i}/{len(files)}] {os.path.basename(file_path)}")
+        try:
+            data = process_file_simple(file_path, model, generation_config)
+            all_data.extend(data)
+        except Exception as e:
+            logging.error(f"Erro ao processar {file_path}: {e}")
+    
+    # Salva resultados
+    if all_data:
+        rows = flatten_data(all_data)
+        save_results(rows, args.out_dir)
+        logging.info("=== PROCESSAMENTO CONCLUÍDO ===")
+    else:
+        logging.error("Nenhum dado extraído. Verifique os arquivos e configurações.")
+
+if __name__ == "__main__":
+    main()
