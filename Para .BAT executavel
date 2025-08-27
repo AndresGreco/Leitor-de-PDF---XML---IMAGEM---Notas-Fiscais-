@@ -1,0 +1,281 @@
+import os
+import sys
+import json
+import logging
+import time
+from typing import List, Dict, Any, Optional
+
+# Instala dependências automaticamente
+def install_requirements():
+    required_packages = [
+        'google-generativeai',
+        'PyMuPDF',
+        'pandas',
+        'python-dateutil',
+        'openpyxl'
+    ]
+    
+    for package in required_packages:
+        try:
+            __import__(package.replace('-', '_'))
+        except ImportError:
+            print(f"Instalando {package}...")
+            os.system(f'pip install {package}')
+
+# Instala dependências na primeira execução
+try:
+    import fitz
+    import pandas as pd
+    from dateutil import parser as dateparser
+    import google.generativeai as genai
+except ImportError:
+    print("Instalando dependências necessárias...")
+    install_requirements()
+    import fitz
+    import pandas as pd
+    from dateutil import parser as dateparser
+    import google.generativeai as genai
+
+# =========================
+# CONFIGURAÇÕES
+# =========================
+GEMINI_API_KEY = "---------"
+DEFAULT_GEMINI_MODEL = "gemini-1.5-flash"
+
+def get_execution_directory():
+    """Retorna o diretório onde o script está sendo executado"""
+    return os.path.dirname(os.path.abspath(__file__))
+
+def setup_logging():
+    """Configura logging"""
+    exec_dir = get_execution_directory()
+    log_file = os.path.join(exec_dir, "extrator_log.txt")
+    
+    if os.path.exists(log_file):
+        try:
+            os.remove(log_file)
+        except:
+            pass
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=[
+            logging.FileHandler(log_file, encoding="utf-8"),
+            logging.StreamHandler()
+        ]
+    )
+    return log_file
+
+def find_documents_in_directory(directory):
+    """Encontra documentos suportados"""
+    supported_extensions = {'.pdf', '.jpg', '.jpeg', '.png', '.xml'}
+    found_files = []
+    
+    for root, dirs, files in os.walk(directory):
+        for file in files:
+            if any(file.lower().endswith(ext) for ext in supported_extensions):
+                found_files.append(os.path.join(root, file))
+    
+    return sorted(found_files)
+
+def show_banner():
+    """Mostra banner inicial"""
+    print("=" * 60)
+    print("    EXTRATOR DE DADOS DE NOTAS FISCAIS")
+    print("    Versão 1.0 - Minelli Engenharia")
+    print("=" * 60)
+    print()
+
+def init_gemini():
+    """Inicializa o Gemini"""
+    genai.configure(api_key=GEMINI_API_KEY)
+    generation_config = {
+        "temperature": 0.2,
+        "max_output_tokens": 4096,
+        "response_mime_type": "application/json",
+    }
+    model = genai.GenerativeModel(model_name=DEFAULT_GEMINI_MODEL, generation_config=generation_config)
+    return model, generation_config
+
+def extract_text_from_pdf(path: str) -> str:
+    """Extrai texto de PDF"""
+    texts = []
+    try:
+        with fitz.open(path) as doc:
+            for page in doc:
+                text = page.get_text("text")
+                if text and len(text.strip()) > 10:
+                    texts.append(text)
+    except Exception as e:
+        logging.error(f"Erro ao ler PDF {path}: {e}")
+    return "\n".join(texts)
+
+EXTRACTION_PROMPT = """
+Extraia os dados desta nota fiscal e retorne APENAS um JSON válido:
+
+{
+  "fornecedor": "nome do fornecedor",
+  "cnpj": "cnpj se encontrado",
+  "data_emissao": "AAAA-MM-DD",
+  "numero_nota": "número da nota",
+  "total_nota": 123.45,
+  "observacoes": "observações relevantes"
+}
+
+IMPORTANTE:
+- Retorne SOMENTE o JSON, sem texto adicional
+- Use null para campos não encontrados
+- Para datas, use formato AAAA-MM-DD
+- Para valores, use números com ponto decimal
+
+DOCUMENTO:
+"""
+
+def call_gemini(model, generation_config, text: str) -> Optional[Dict]:
+    """Chama o Gemini para extrair dados"""
+    try:
+        prompt = EXTRACTION_PROMPT + text[:80000]
+        response = model.generate_content([prompt], generation_config=generation_config)
+        
+        if not response.text:
+            return None
+            
+        json_text = response.text.strip()
+        if json_text.startswith("```"):
+            lines = json_text.split("\n")
+            json_text = "\n".join(lines[1:-1]) if len(lines) > 2 else json_text
+        
+        return json.loads(json_text)
+    except Exception as e:
+        logging.error(f"Erro no Gemini: {e}")
+        return None
+
+def process_files(files: List[str], model, generation_config) -> List[Dict]:
+    """Processa lista de arquivos"""
+    results = []
+    total_files = len(files)
+    
+    for i, file_path in enumerate(files, 1):
+        filename = os.path.basename(file_path)
+        relative_path = os.path.relpath(file_path, get_execution_directory())
+        
+        print(f"[{i}/{total_files}] Processando: {filename}")
+        logging.info(f"[{i}/{total_files}] Processando: {relative_path}")
+        
+        if not filename.lower().endswith('.pdf'):
+            print(f"  ⚠️  Pulando {filename} (apenas PDFs suportados)")
+            continue
+        
+        text = extract_text_from_pdf(file_path)
+        if not text or len(text.strip()) < 20:
+            print(f"  ⚠️  Pouco texto encontrado em {filename}")
+            continue
+        
+        print(f"  🤖 Analisando com IA...")
+        data = call_gemini(model, generation_config, text)
+        
+        if data:
+            data["arquivo"] = filename
+            data["caminho_relativo"] = relative_path
+            results.append(data)
+            print(f"  ✅ Dados extraídos com sucesso!")
+        else:
+            print(f"  ❌ Falha ao extrair dados")
+        
+        time.sleep(1)
+    
+    return results
+
+def save_results(data: List[Dict], output_dir: str):
+    """Salva resultados"""
+    if not data:
+        print("\n❌ Nenhum dado foi extraído.")
+        return
+    
+    df = pd.DataFrame(data)
+    
+    preferred_cols = ["arquivo", "caminho_relativo", "fornecedor", "cnpj", "data_emissao", "numero_nota", "total_nota", "observacoes"]
+    existing_cols = [c for c in preferred_cols if c in df.columns]
+    other_cols = [c for c in df.columns if c not in preferred_cols]
+    df = df[existing_cols + other_cols]
+    
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    csv_path = os.path.join(output_dir, f"notas_extraidas_{timestamp}.csv")
+    xlsx_path = os.path.join(output_dir, f"notas_extraidas_{timestamp}.xlsx")
+    
+    try:
+        df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+        print(f"✅ CSV salvo: {os.path.basename(csv_path)}")
+    except Exception as e:
+        logging.error(f"Erro ao salvar CSV: {e}")
+    
+    try:
+        df.to_excel(xlsx_path, index=False, engine="openpyxl")
+        print(f"✅ Excel salvo: {os.path.basename(xlsx_path)}")
+    except Exception as e:
+        print(f"⚠️  Excel não pôde ser salvo, mas CSV foi criado")
+    
+    print(f"\n📊 Total de registros extraídos: {len(data)}")
+
+def main():
+    """Função principal"""
+    try:
+        show_banner()
+        log_file = setup_logging()
+        exec_dir = get_execution_directory()
+        
+        print(f"📁 Pasta de trabalho: {exec_dir}")
+        print(f"   Log sendo salvo em: {os.path.basename(log_file)}")
+        print()
+        
+        print("🔍 Procurando documentos...")
+        files = find_documents_in_directory(exec_dir)
+        
+        if not files:
+            print("❌ Nenhum documento encontrado!")
+            print("   Formatos suportados: PDF, JPG, PNG, XML")
+            print("   Coloque os arquivos na mesma pasta e tente novamente.")
+            input("\nPressione Enter para sair...")
+            return
+        
+        pdf_files = [f for f in files if f.lower().endswith('.pdf')]
+        other_files = [f for f in files if not f.lower().endswith('.pdf')]
+        
+        print(f"📄 Encontrados {len(pdf_files)} PDFs para processar")
+        if other_files:
+            print(f"⚠️  {len(other_files)} outros arquivos encontrados (serão ignorados)")
+        print()
+        
+        if not pdf_files:
+            print("❌ Nenhum PDF encontrado!")
+            input("\nPressione Enter para sair...")
+            return
+        
+        print("🤖 Inicializando IA...")
+        try:
+            model, config = init_gemini()
+            print("✅ IA inicializada com sucesso!")
+        except Exception as e:
+            print(f"❌ Erro ao inicializar IA: {e}")
+            input("\nPressione Enter para sair...")
+            return
+        
+        print()
+        results = process_files(pdf_files, model, config)
+        
+        print("\n💾 Salvando resultados...")
+        save_results(results, exec_dir)
+        
+        print("\n🎉 Processamento concluído!")
+        
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Processamento interrompido.")
+    except Exception as e:
+        print(f"\n❌ Erro inesperado: {e}")
+        logging.error(f"Erro inesperado: {e}")
+    
+    input("\nPressione Enter para sair...")
+
+if __name__ == "__main__":
+    main()
